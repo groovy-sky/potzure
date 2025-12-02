@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Dashboard &lsaquo; WordPress</title>
+  <style>
+    body { margin:0; font-family:sans-serif; }
+    header { background:#1d2327; color:#fff; padding:12px 20px; }
+    main { display:flex; }
+    nav { width:200px; background:#2c3338; color:#f0f0f1; min-height:100vh; padding:12px; }
+    nav a { color:#f0f0f1; display:block; margin:8px 0; text-decoration:none; }
+    section { flex:1; padding:24px; }
+    table { border-collapse:collapse; width:100%; }
+    th, td { border:1px solid #ccd0d4; padding:8px; text-align:left; }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>WordPress 6.4.2</strong> &mdash; Multisite Admin
+  </header>
+  <main>
+    <nav>
+      <a href="/wp-admin/">Dashboard</a>
+      <a href="/wp-admin/plugins.php">Plugins</a>
+      <a href="/wp-admin/users.php">Users</a>
+      <a href="/wp-admin/upload.php">Media</a>
+    </nav>
+    <section>
+      <h2>Recently Active Plugins</h2>
+      <table>
+        <tr><th>Plugin</th><th>Version</th><th>Status</th></tr>
+        <tr><td>XML-RPC Bridge</td><td>3.2.1</td><td>Active</td></tr>
+        <tr><td>WooCommerce</td><td>8.3.1</td><td>Update available</td></tr>
+        <tr><td>Gravity Forms</td><td>2.8.7</td><td>Active</td></tr>
+        <tr><td>SEO Pack</td><td>4.5.0</td><td>Disabled</td></tr>
+      </table>
+    </section>
+  </main>
+</body>
+</html>
