@@ -6,14 +6,17 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/url"
+	"io"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
+	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/appendblob"
+	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/bloberror"
 )
 
 // Event describes a single honeypot interaction that is persisted to disk.
@@ -41,7 +44,6 @@ type Logger struct {
 	currentSegment string
 	file           *os.File
 	azure          *azureBlobClient
-	azurePrefix    string
 	currentBlob    string
 	mu             sync.Mutex
 }
@@ -54,10 +56,6 @@ const (
 	azureStorageAccountEnv   = "AZURE_STORAGE_ACCOUNT"
 	azureStorageContainerEnv = "AZURE_STORAGE_CONTAINER"
 	azureClientIDEnv         = "AZURE_CLIENT_ID"
-	azureResource            = "https://storage.azure.com/"
-	metadataEndpoint         = "http://169.254.169.254/metadata/identity/oauth2/token"
-	metadataAPIVersion       = "2018-02-01"
-	azureAPIVersion          = "2021-04-10"
 )
 
 func NewJSONLogger(path string) (*Logger, error) {
@@ -81,12 +79,14 @@ func NewJSONLogger(path string) (*Logger, error) {
 	container := os.Getenv(azureStorageContainerEnv)
 	if account != "" && container != "" {
 		prefix := sanitizeAzurePrefix(dir)
-		client := newAzureBlobClient(account, container, prefix, os.Getenv(azureClientIDEnv))
+		client, err := newAzureBlobClient(account, container, prefix, os.Getenv(azureClientIDEnv))
+		if err != nil {
+			return nil, err
+		}
 		logger := &Logger{
-			base:        base,
-			extension:   ext,
-			azure:       client,
-			azurePrefix: prefix,
+			base:      base,
+			extension: ext,
+			azure:     client,
 		}
 		if err := logger.rotate(time.Now().UTC()); err != nil {
 			return nil, err
@@ -163,11 +163,7 @@ func (l *Logger) rotate(now time.Time) error {
 }
 
 func (l *Logger) buildBlobPath(segment string) string {
-	name := fmt.Sprintf("%s-%s%s", l.base, segment, l.extension)
-	if l.azurePrefix == "" {
-		return name
-	}
-	return strings.TrimSuffix(l.azurePrefix, "/") + "/" + name
+	return fmt.Sprintf("%s-%s%s", l.base, segment, l.extension)
 }
 
 func sanitizeAzurePrefix(dir string) string {
@@ -181,180 +177,74 @@ func sanitizeAzurePrefix(dir string) string {
 }
 
 type azureBlobClient struct {
-	account       string
-	container     string
-	prefix        string
-	client        *http.Client
-	tokenProvider *managedIdentityTokenProvider
+	account    string
+	container  string
+	credential azcore.TokenCredential
+	prefix     string
 }
 
-func newAzureBlobClient(account, container, prefix, clientID string) *azureBlobClient {
-	return &azureBlobClient{
-		account:   account,
-		container: container,
-		prefix:    prefix,
-		client: &http.Client{
-			Timeout: 30 * time.Second,
-		},
-		tokenProvider: newManagedIdentityTokenProvider(azureResource, clientID),
+func newAzureBlobClient(account, container, prefix, clientID string) (*azureBlobClient, error) {
+	var cred azcore.TokenCredential
+	var err error
+	if clientID != "" {
+		options := &azidentity.ManagedIdentityCredentialOptions{ID: azidentity.ClientID(clientID)}
+		cred, err = azidentity.NewManagedIdentityCredential(options)
+	} else {
+		cred, err = azidentity.NewManagedIdentityCredential(nil)
 	}
+	if err != nil {
+		return nil, err
+	}
+	return &azureBlobClient{
+		account:    account,
+		container:  container,
+		credential: cred,
+		prefix:     prefix,
+	}, nil
 }
 
-func (c *azureBlobClient) EnsureAppendBlob(path string) error {
+func (c *azureBlobClient) EnsureAppendBlob(blob string) error {
+	client, err := c.newAppendBlobClient(blob)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	urlStr := c.buildURL(path)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, urlStr, http.NoBody)
-	if err != nil {
+	_, err = client.Create(ctx, nil)
+	if err != nil && !bloberror.HasCode(err, bloberror.BlobAlreadyExists) {
 		return err
 	}
-	req.Header.Set("x-ms-version", azureAPIVersion)
-	req.Header.Set("x-ms-date", time.Now().UTC().Format(http.TimeFormat))
-	req.Header.Set("x-ms-blob-type", "AppendBlob")
-	req.Header.Set("Content-Length", "0")
-	if err := c.authorize(req); err != nil {
-		return err
-	}
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusCreated || resp.StatusCode == http.StatusAccepted {
-		return nil
-	}
-	if resp.StatusCode == http.StatusConflict {
-		return nil
-	}
-	return fmt.Errorf("azure blob create failed: %s", resp.Status)
+	return nil
 }
 
-func (c *azureBlobClient) Append(path string, data []byte) error {
+func (c *azureBlobClient) Append(blob string, data []byte) error {
+	client, err := c.newAppendBlobClient(blob)
+	if err != nil {
+		return err
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	u, err := url.Parse(c.buildURL(path))
-	if err != nil {
-		return err
+	reader := nopSeekCloser{ReadSeeker: bytes.NewReader(data)}
+	_, err = client.AppendBlock(ctx, reader, nil)
+	return err
+}
+
+func (c *azureBlobClient) newAppendBlobClient(blob string) (*appendblob.Client, error) {
+	url := fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s", c.account, c.container, c.applyPrefix(blob))
+	return appendblob.NewClient(url, c.credential, nil)
+}
+
+func (c *azureBlobClient) applyPrefix(blob string) string {
+	if c.prefix == "" {
+		return blob
 	}
-	q := u.Query()
-	q.Set("comp", "appendblock")
-	u.RawQuery = q.Encode()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, u.String(), bytes.NewReader(data))
-	if err != nil {
-		return err
-	}
-	req.Header.Set("x-ms-version", azureAPIVersion)
-	req.Header.Set("x-ms-date", time.Now().UTC().Format(http.TimeFormat))
-	req.Header.Set("Content-Length", strconv.Itoa(len(data)))
-	req.Header.Set("Content-Type", "application/json")
-	if err := c.authorize(req); err != nil {
-		return err
-	}
-	resp, err := c.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusCreated {
-		return fmt.Errorf("azure append failed: %s", resp.Status)
-	}
+	return strings.TrimSuffix(c.prefix, "/") + "/" + strings.TrimPrefix(blob, "/")
+}
+
+type nopSeekCloser struct {
+	io.ReadSeeker
+}
+
+func (n nopSeekCloser) Close() error {
 	return nil
-}
-
-func (c *azureBlobClient) buildURL(path string) string {
-	pl := strings.TrimPrefix(path, "/")
-	basePath := pl
-	if c.prefix != "" {
-		basePath = strings.TrimSuffix(c.prefix, "/") + "/" + basePath
-	}
-	u := url.URL{
-		Scheme: "https",
-		Host:   fmt.Sprintf("%s.blob.core.windows.net", c.account),
-		Path:   fmt.Sprintf("/%s/%s", c.container, basePath),
-	}
-	return u.String()
-}
-
-func (c *azureBlobClient) authorize(req *http.Request) error {
-	token, err := c.tokenProvider.Token(req.Context())
-	if err != nil {
-		return err
-	}
-	req.Header.Set("Authorization", "Bearer "+token)
-	return nil
-}
-
-type managedIdentityTokenProvider struct {
-	resource  string
-	clientID  string
-	client    *http.Client
-	mu        sync.Mutex
-	token     string
-	expiresOn time.Time
-}
-
-func newManagedIdentityTokenProvider(resource, clientID string) *managedIdentityTokenProvider {
-	return &managedIdentityTokenProvider{
-		resource: resource,
-		clientID: clientID,
-		client:   &http.Client{Timeout: 5 * time.Second},
-	}
-}
-
-func (p *managedIdentityTokenProvider) Token(ctx context.Context) (string, error) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if time.Until(p.expiresOn) > time.Minute && p.token != "" {
-		return p.token, nil
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataEndpoint, http.NoBody)
-	if err != nil {
-		return "", err
-	}
-	q := req.URL.Query()
-	q.Set("api-version", metadataAPIVersion)
-	q.Set("resource", p.resource)
-	if p.clientID != "" {
-		q.Set("client_id", p.clientID)
-	}
-	req.URL.RawQuery = q.Encode()
-	req.Header.Set("Metadata", "true")
-	resp, err := p.client.Do(req)
-	if err != nil {
-		return "", err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("managed identity token request failed: %s", resp.Status)
-	}
-	var payload struct {
-		AccessToken string `json:"access_token"`
-		ExpiresOn   string `json:"expires_on"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&payload); err != nil {
-		return "", err
-	}
-	if payload.AccessToken == "" {
-		return "", errors.New("managed identity response missing access_token")
-	}
-	expires, err := parseExpiresOn(payload.ExpiresOn)
-	if err != nil {
-		return "", err
-	}
-	p.token = payload.AccessToken
-	p.expiresOn = expires
-	return p.token, nil
-}
-
-func parseExpiresOn(raw string) (time.Time, error) {
-	if raw == "" {
-		return time.Time{}, errors.New("expires_on empty")
-	}
-	if epoch, err := strconv.ParseInt(raw, 10, 64); err == nil {
-		return time.Unix(epoch, 0), nil
-	}
-	if parsed, err := time.Parse(time.RFC3339, raw); err == nil {
-		return parsed, nil
-	}
-	return time.Time{}, fmt.Errorf("cannot parse expires_on: %s", raw)
 }

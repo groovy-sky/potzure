@@ -7,6 +7,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o
 
 # Runtime stage
 FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 RUN useradd --create-home --uid 10001 honeypot \
     && mkdir -p /var/lib/honeypot/uploads \
     && touch /var/lib/honeypot/events.log \
