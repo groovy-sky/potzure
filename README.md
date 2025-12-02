@@ -7,6 +7,7 @@ Minimal Go HTTP honeypot that emulates common CMS administration paths, logs eve
 - WordPress, Joomla, and Drupal login/admin routes with believable HTML.
 - Structured JSON logging (`events.log`) including headers, form data, body hash, and saved upload paths.
 - Time-sliced JSON logs stored under your OS cache directory by default (override with `-log`).
+- Optional Azure Blob backend: set `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_CONTAINER`, and (for user-assigned identities) `AZURE_CLIENT_ID` to stream logs into append blobs via managed identity.
 - Uploads written to `uploads/` with per-file SHA256 hashes.
 - Simple per-IP rate limiting to avoid resource exhaustion.
 - No TLS by default; intended for use behind an isolated network sensor.
