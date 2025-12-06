@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -49,6 +50,14 @@ type Server struct {
 	templates  templates
 }
 
+var faviconICO = func() []byte {
+	data, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAuMBg6c1N+8AAAAASUVORK5CYII=")
+	if err != nil {
+		panic("failed to decode favicon payload: " + err.Error())
+	}
+	return data
+}()
+
 // NewServer assembles the HTTP server and routes.
 func NewServer(cfg Config) (*Server, error) {
 	if cfg.Logger == nil || cfg.FileStore == nil {
@@ -81,6 +90,8 @@ func NewServer(cfg Config) (*Server, error) {
 	mux.HandleFunc("/index.php", s.handleJoomlaComponent)
 	mux.HandleFunc("/user/login", s.handleDrupalLogin)
 	mux.HandleFunc("/admin/modules", s.handleDrupalModules)
+	mux.HandleFunc("/robots.txt", s.handleRobotsTxt)
+	mux.HandleFunc("/favicon.ico", s.handleFavicon)
 	mux.HandleFunc("/", s.handleDefault)
 
 	var handler http.Handler = mux
@@ -207,6 +218,31 @@ func (s *Server) handleDrupalLogin(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleDrupalModules(w http.ResponseWriter, r *http.Request) {
 	s.writeHTML(w, s.templates.DrupalModules)
+}
+
+func (s *Server) handleRobotsTxt(w http.ResponseWriter, r *http.Request) {
+	host := r.Host
+	if host == "" {
+		host = "example.com"
+	}
+	lines := []string{
+		"User-agent: *",
+		"Disallow: /wp-admin/",
+		"Allow: /wp-admin/admin-ajax.php",
+		"Disallow: /administrator/",
+		"Disallow: /core/install.php",
+		fmt.Sprintf("Sitemap: https://%s/sitemap_index.xml", host),
+		fmt.Sprintf("Host: %s", host),
+		"\n# Managed by CMS Edge",
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	_, _ = w.Write([]byte(strings.Join(lines, "\n")))
+}
+
+func (s *Server) handleFavicon(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "public, max-age=86400, immutable")
+	_, _ = w.Write(faviconICO)
 }
 
 func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
