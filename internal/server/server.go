@@ -241,6 +241,9 @@ func (s *Server) handleUpload(w http.ResponseWriter, r *http.Request) {
 			saved, err := s.cfg.FileStore.Save(fileHeader.Filename, file)
 			file.Close()
 			if err != nil {
+				if errors.Is(err, store.ErrEmptyUpload) {
+					continue
+				}
 				extras.addMetadata("upload_error", err.Error())
 				continue
 			}

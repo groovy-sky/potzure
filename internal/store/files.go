@@ -4,15 +4,18 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"regexp"
-
-	"os"
 )
 
 var filenameCleaner = regexp.MustCompile(`[^a-zA-Z0-9._-]+`)
+
+// ErrEmptyUpload indicates no data was written for a submitted file.
+var ErrEmptyUpload = errors.New("empty upload")
 
 // FileStore persists uploaded files and records their hashes.
 type FileStore struct {
@@ -60,6 +63,11 @@ func (fs *FileStore) Save(originalName string, r io.Reader) (SavedFile, error) {
 	written, err := io.Copy(io.MultiWriter(f, h), r)
 	if err != nil {
 		return SavedFile{}, err
+	}
+	if written == 0 {
+		f.Close()
+		_ = os.Remove(destPath)
+		return SavedFile{}, ErrEmptyUpload
 	}
 
 	return SavedFile{

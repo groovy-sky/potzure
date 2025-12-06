@@ -77,7 +77,7 @@ func resolveLogPath(requested string) (string, error) {
 	}
 
 	if cacheDir, err := os.UserCacheDir(); err == nil && cacheDir != "" {
-		path := filepath.Join(cacheDir, "potzure", "events.log")
+		path := filepath.Join(cacheDir, "potzure", "events.csv")
 		if err := os.MkdirAll(filepath.Dir(path), 0o750); err == nil {
 			return path, nil
 		}
@@ -86,13 +86,13 @@ func resolveLogPath(requested string) (string, error) {
 	execPath, err := os.Executable()
 	if err == nil {
 		execDir := filepath.Dir(execPath)
-		path := filepath.Join(execDir, "events.log")
+		path := filepath.Join(execDir, "events.csv")
 		if err := os.MkdirAll(execDir, 0o750); err == nil {
 			return path, nil
 		}
 	}
 
-	path := "events.log"
+	path := "events.csv"
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 		return "", err
 	}

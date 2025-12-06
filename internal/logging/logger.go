@@ -3,8 +3,8 @@ package logging
 import (
 	"bytes"
 	"context"
+	"encoding/csv"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -38,13 +38,12 @@ const segmentFormat = "20060102-1504"
 
 // Logger writes JSON events to timestamped log segments.
 type Logger struct {
-	dir            string
 	base           string
 	extension      string
 	currentSegment string
-	file           *os.File
 	azure          *azureBlobClient
 	currentBlob    string
+	headerWritten  bool
 	mu             sync.Mutex
 }
 
@@ -59,45 +58,26 @@ const (
 )
 
 func NewJSONLogger(path string) (*Logger, error) {
-	dir := filepath.Dir(path)
-	if dir == "." && !strings.Contains(path, string(filepath.Separator)) {
-		dir = "."
-	}
 	base := filepath.Base(path)
 	if base == "." || base == "" {
 		base = "events.log"
 	}
 	ext := filepath.Ext(base)
-	if ext == "" {
-		ext = ".log"
-	}
 	base = strings.TrimSuffix(base, ext)
 	if base == "" {
 		base = "events"
 	}
+	ext = ".csv"
 	account := os.Getenv(azureStorageAccountEnv)
 	container := os.Getenv(azureStorageContainerEnv)
-	if account != "" && container != "" {
-		prefix := sanitizeAzurePrefix(dir)
-		client, err := newAzureBlobClient(account, container, prefix, os.Getenv(azureClientIDEnv))
-		if err != nil {
-			return nil, err
-		}
-		logger := &Logger{
-			base:      base,
-			extension: ext,
-			azure:     client,
-		}
-		if err := logger.rotate(time.Now().UTC()); err != nil {
-			return nil, err
-		}
-		return logger, nil
+	if account == "" || container == "" {
+		return nil, fmt.Errorf("azure blob logging requires %s and %s", azureStorageAccountEnv, azureStorageContainerEnv)
 	}
-
-	if err := os.MkdirAll(dir, 0o750); err != nil {
+	client, err := newAzureBlobClient(account, container, os.Getenv(azureClientIDEnv))
+	if err != nil {
 		return nil, err
 	}
-	l := &Logger{dir: dir, base: base, extension: ext}
+	l := &Logger{base: base, extension: ext, azure: client}
 	if err := l.rotate(time.Now().UTC()); err != nil {
 		return nil, err
 	}
@@ -111,30 +91,31 @@ func (l *Logger) Log(evt Event) error {
 	if err := l.rotate(evt.Timestamp.UTC()); err != nil {
 		return err
 	}
-	line, err := json.Marshal(evt)
+	if !l.headerWritten {
+		header, err := marshalCSVRecord([]string{"src_ip", "uri", "method", "user_agent", "form"})
+		if err != nil {
+			return err
+		}
+		if err := l.azure.Append(l.currentBlob, header); err != nil {
+			return err
+		}
+		l.headerWritten = true
+	}
+	record, err := marshalCSVRecord([]string{
+		evt.SrcIP,
+		evt.URI,
+		evt.Method,
+		evt.UserAgent,
+		encodeForm(evt.Form),
+	})
 	if err != nil {
 		return err
 	}
-	line = append(line, '\n')
-	if l.azure != nil {
-		return l.azure.Append(l.currentBlob, line)
-	}
-	if l.file == nil {
-		return errors.New("file handle is nil")
-	}
-	_, err = l.file.Write(line)
-	return err
+	return l.azure.Append(l.currentBlob, record)
 }
 
 // Close flushes all buffers and closes the file handle.
 func (l *Logger) Close() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.file != nil {
-		err := l.file.Close()
-		l.file = nil
-		return err
-	}
 	return nil
 }
 
@@ -143,22 +124,13 @@ func (l *Logger) rotate(now time.Time) error {
 	if segment == l.currentSegment {
 		return nil
 	}
-	if l.azure != nil {
-		l.currentSegment = segment
-		l.currentBlob = l.buildBlobPath(segment)
-		return l.azure.EnsureAppendBlob(l.currentBlob)
-	}
-	if l.file != nil {
-		_ = l.file.Close()
-	}
-	filename := fmt.Sprintf("%s-%s%s", l.base, segment, l.extension)
-	path := filepath.Join(l.dir, filename)
-	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o640)
+	l.currentSegment = segment
+	l.currentBlob = l.buildBlobPath(segment)
+	created, err := l.azure.EnsureAppendBlob(l.currentBlob)
 	if err != nil {
 		return err
 	}
-	l.file = f
-	l.currentSegment = segment
+	l.headerWritten = !created
 	return nil
 }
 
@@ -166,24 +138,13 @@ func (l *Logger) buildBlobPath(segment string) string {
 	return fmt.Sprintf("%s-%s%s", l.base, segment, l.extension)
 }
 
-func sanitizeAzurePrefix(dir string) string {
-	if dir == "." || dir == "" {
-		return ""
-	}
-	clean := filepath.ToSlash(dir)
-	clean = strings.Trim(clean, "/")
-	clean = strings.ReplaceAll(clean, ":", "")
-	return clean
-}
-
 type azureBlobClient struct {
 	account    string
 	container  string
 	credential azcore.TokenCredential
-	prefix     string
 }
 
-func newAzureBlobClient(account, container, prefix, clientID string) (*azureBlobClient, error) {
+func newAzureBlobClient(account, container, clientID string) (*azureBlobClient, error) {
 	var cred azcore.TokenCredential
 	var err error
 	if clientID != "" {
@@ -199,22 +160,24 @@ func newAzureBlobClient(account, container, prefix, clientID string) (*azureBlob
 		account:    account,
 		container:  container,
 		credential: cred,
-		prefix:     prefix,
 	}, nil
 }
 
-func (c *azureBlobClient) EnsureAppendBlob(blob string) error {
+func (c *azureBlobClient) EnsureAppendBlob(blob string) (bool, error) {
 	client, err := c.newAppendBlobClient(blob)
 	if err != nil {
-		return err
+		return false, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	_, err = client.Create(ctx, nil)
-	if err != nil && !bloberror.HasCode(err, bloberror.BlobAlreadyExists) {
-		return err
+	if err == nil {
+		return true, nil
 	}
-	return nil
+	if bloberror.HasCode(err, bloberror.BlobAlreadyExists) {
+		return false, nil
+	}
+	return false, err
 }
 
 func (c *azureBlobClient) Append(blob string, data []byte) error {
@@ -230,15 +193,8 @@ func (c *azureBlobClient) Append(blob string, data []byte) error {
 }
 
 func (c *azureBlobClient) newAppendBlobClient(blob string) (*appendblob.Client, error) {
-	url := fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s", c.account, c.container, c.applyPrefix(blob))
+	url := fmt.Sprintf("https://%s.blob.core.windows.net/%s/%s", c.account, c.container, strings.TrimPrefix(blob, "/"))
 	return appendblob.NewClient(url, c.credential, nil)
-}
-
-func (c *azureBlobClient) applyPrefix(blob string) string {
-	if c.prefix == "" {
-		return blob
-	}
-	return strings.TrimSuffix(c.prefix, "/") + "/" + strings.TrimPrefix(blob, "/")
 }
 
 type nopSeekCloser struct {
@@ -247,4 +203,29 @@ type nopSeekCloser struct {
 
 func (n nopSeekCloser) Close() error {
 	return nil
+}
+
+func marshalCSVRecord(record []string) ([]byte, error) {
+	var buf bytes.Buffer
+	w := csv.NewWriter(&buf)
+	w.Comma = '\\'
+	if err := w.Write(record); err != nil {
+		return nil, err
+	}
+	w.Flush()
+	if err := w.Error(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+func encodeForm(form map[string][]string) string {
+	if len(form) == 0 {
+		return ""
+	}
+	b, err := json.Marshal(form)
+	if err != nil {
+		return ""
+	}
+	return string(b)
 }
